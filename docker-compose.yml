@@ -1,0 +1,24 @@
+# ── Signal Bot — Docker Compose ──
+
+services:
+
+  dashboard:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./signal_bot.db:/app/signal_bot.db   # persist stats
+      - ./session:/app/session                # persist Telegram login
+      - ./.env:/app/.env                      # API keys
+    restart: unless-stopped
+
+  listener:
+    build: .
+    command: python -m app.telegram.listener
+    volumes:
+      - ./signal_bot.db:/app/signal_bot.db
+      - ./session:/app/session
+      - ./.env:/app/.env
+    restart: unless-stopped
+    depends_on:
+      - dashboard
