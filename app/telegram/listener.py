@@ -3,9 +3,9 @@ Telethon userbot — the heart of the signal bot.
 
 What it does:
 1. Listens to new and edited messages in the VIP Telegram channel.
-2. Sends each message to the AI parser → gets structured JSON.
-3. Opens positions on Binance Demo (OPEN signals).
-4. Updates stops / take-profits / closes (UPDATE / CLOSE signals).
+2. Parses each message with regex (instant) — no LLM.
+3. Opens positions on Binance Demo (OPEN signals), including limit orders.
+4. Handles LIMIT_FILLED, CANCEL_ORDER, UPDATE_STOP/TP, PARTIAL_CLOSE, CLOSE.
 5. Stores everything in SQLite for the dashboard.
 
 Run:
@@ -20,7 +20,7 @@ from typing import Optional
 
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel
-from sqlalchemy import select as sa_select
+from sqlalchemy import select as sa_select, desc
 
 from app.config import config
 from app.parser.ai_parser import parser as ai_parser
@@ -117,6 +117,75 @@ def calc_position_size(
 
 
 # ---------------------------------------------------------------------------
+# Trade lookup helpers
+# ---------------------------------------------------------------------------
+
+
+async def find_trade_by_pair(pair: str, session) -> Optional[Trade]:
+    """
+    Find the most recent OPEN/PENDING/UPDATED trade for a pair.
+    Used for updates that don't come as replies (just mention #PAIR).
+    """
+    result = await session.execute(
+        sa_select(Trade)
+        .where(
+            Trade.pair == pair,
+            Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN, TradeStatus.UPDATED]),
+        )
+        .order_by(desc(Trade.id))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def find_trade_by_reply(reply_to_id: int, session) -> Optional[Trade]:
+    """
+    Find a trade by the Telegram message ID it was created from.
+    Used for reply-based updates (most common).
+    """
+    # Step 1: find the RawSignal that this message replies to
+    result = await session.execute(
+        sa_select(RawSignal).where(
+            RawSignal.tg_message_id == reply_to_id
+        )
+    )
+    original_signal = result.scalar_one_or_none()
+
+    if not original_signal:
+        return None
+
+    # Step 2: find the Trade linked to that signal
+    result = await session.execute(
+        sa_select(Trade).where(Trade.signal_id == original_signal.id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def find_trade_for_update(
+    parsed: dict,
+    raw: RawSignal,
+    session,
+) -> Optional[Trade]:
+    """
+    Try to find the relevant trade:
+    1. If this is a reply — find by reply_to message ID.
+    2. If parsed has a 'pair' field — find the most recent open trade for that pair.
+    """
+    # Try reply first
+    if raw.tg_reply_to_id:
+        trade = await find_trade_by_reply(raw.tg_reply_to_id, session)
+        if trade:
+            return trade
+
+    # Fallback: find by pair
+    pair = parsed.get("pair")
+    if pair:
+        return await find_trade_by_pair(pair, session)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Signal handler — OPEN (new position)
 # ---------------------------------------------------------------------------
 
@@ -144,14 +213,32 @@ async def handle_open_signal(
     tp         = float(parsed["take_profit"])
     sl         = float(parsed["stop_loss"])
     lev        = int(parsed.get("leverage", config.DEFAULT_LEVERAGE))
-    deposit    = float(parsed.get("deposit") or config.DEFAULT_DEPOSIT)
-    risk_pct   = float(parsed.get("risk_pct") or config.DEFAULT_RISK_PERCENT)
+    # ALWAYS use OUR deposit, not the one from the signal (that's the author's deposit)
+    deposit    = config.DEFAULT_DEPOSIT  # $10
 
-    qty = calc_position_size(deposit, risk_pct, entry, sl)
+    # Margin = deposit (e.g. $10). Position notional = margin × leverage = $10 × 20x = $200
+    position_notional = deposit * lev  # e.g. $10 × 20 = $200
+    qty_raw = position_notional / entry  # e.g. $200 / $0.10424 ≈ 1918 DOGE
+
+    # Round quantity to Binance stepSize
+    sym_info = await exchange.get_symbol_info(pair)
+    if sym_info:
+        step = sym_info.get("stepSize", 0.0001)
+        min_qty = sym_info.get("minQty", 0)
+        qty = exchange.round_quantity(qty_raw, step)
+        if qty < min_qty:
+            qty = min_qty
+        logger.info(
+            "[OPEN] %s qty: \${%.2f} / \${%.6f} = %.4f → rounded to %s (step=%s)",
+            pair, deposit, entry, qty_raw, qty, step,
+        )
+    else:
+        qty = qty_raw
+        logger.warning("[OPEN] %s — cannot get symbol info, using raw qty", pair)
 
     logger.info(
-        "[OPEN] %s entry=%s(%s) tp=%s sl=%s lev=%sx qty=%.4f",
-        pair, entry, entry_type, tp, sl, lev, qty,
+        "[OPEN] %s entry=%s(%s) tp=%s sl=%s lev=%sx margin=$%.0f notional=$%.0f qty=%s",
+        pair, entry, entry_type, tp, sl, lev, deposit, position_notional, qty,
     )
 
 
@@ -167,10 +254,19 @@ async def handle_open_signal(
 
     if entry_type == "LIMIT":
         order = await exchange.limit_buy(pair, entry, qty)
+
+        # Limit orders might not fill immediately — trade is PENDING
+        fill_price = None
+        status = TradeStatus.PENDING
+        order_id = str(order.get("orderId", ""))
+        logger.info("[OPEN] Limit order placed: %s @ %s (ID=%s)", pair, entry, order_id)
     else:
         order = await exchange.market_buy(pair, qty)
 
-    fill_price = order.get("average") or order.get("price") or entry
+        fill_price = float(order.get("avgPrice") or order.get("price") or entry)
+        status = TradeStatus.OPEN
+        order_id = str(order.get("orderId", ""))
+        logger.info("[OPEN] Market order filled: %s @ %s", pair, fill_price)
 
 
     # --- 3. Place SL and TP orders ---------------------------------------
@@ -192,11 +288,11 @@ async def handle_open_signal(
         risk_per_trade_pct = risk_pct,
         entry_price        = fill_price,
         entry_quantity     = qty,
-        entry_time         = datetime.datetime.utcnow(),
-        entry_order_id     = str(order.get("id", "")),
+        entry_time         = datetime.datetime.utcnow() if status == TradeStatus.OPEN else None,
+        entry_order_id     = order_id,
         current_stop       = sl,
         current_tp         = tp,
-        status             = TradeStatus.OPEN,
+        status             = status,
     )
     session.add(trade)
     await session.flush()
@@ -208,16 +304,122 @@ async def handle_open_signal(
         trade_id    = trade.id,
         action      = "OPEN",
         detail_json = {
+            "entry_type": entry_type,
             "entry_price": fill_price,
             "quantity": qty,
-            "order_id": order.get("id"),
+            "order_id": order_id,
             "order_status": order.get("status"),
         },
     )
     session.add(log_entry)
     await session.commit()
 
-    logger.info("[OPEN] ✅ Trade #%s: %s @ %s", trade.id, pair, fill_price)
+    logger.info("[OPEN] ✅ Trade #%s: %s @ %s (%s)", trade.id, pair, fill_price or entry, status.value)
+
+
+# ---------------------------------------------------------------------------
+# Signal handler — CANCEL_ORDER
+# ---------------------------------------------------------------------------
+
+
+async def handle_cancel_order(
+    parsed: dict,
+    raw: RawSignal,
+    session,
+) -> None:
+    """
+    Cancel a limit order that hasn't been filled yet.
+
+    Looks up the most recent PENDING trade (limit order waiting for fill)
+    and cancels it on Binance.
+    """
+    trade = await find_trade_for_update(parsed, raw, session)
+
+    if not trade:
+        logger.warning("[CANCEL] No pending trade found to cancel")
+        return
+
+    if trade.status != TradeStatus.PENDING:
+        logger.warning("[CANCEL] Trade #%s is %s — not pending, cannot cancel", trade.id, trade.status.value)
+        return
+
+    if not trade.entry_order_id:
+        logger.warning("[CANCEL] Trade #%s has no order_id — cannot cancel", trade.id)
+        return
+
+    logger.info("[CANCEL] Cancelling order %s for %s", trade.entry_order_id, trade.pair)
+
+    try:
+        await exchange.cancel_order(trade.pair, int(trade.entry_order_id))
+    except Exception as exc:
+        logger.warning("[CANCEL] Cancel API call failed (may already be cancelled): %s", exc)
+
+    # Cancel any remaining open orders for this symbol
+    await exchange.cancel_all_open_orders(trade.pair)
+
+    trade.status = TradeStatus.CLOSED
+    trade.exit_reason = "cancelled"
+
+    log_entry = TradeLog(
+        trade_id    = trade.id,
+        action      = "CANCEL_ORDER",
+        detail_json = parsed,
+    )
+    session.add(log_entry)
+    await session.commit()
+
+    logger.info("[CANCEL] ✅ Trade #%s cancelled", trade.id)
+
+
+# ---------------------------------------------------------------------------
+# Signal handler — LIMIT_FILLED
+# ---------------------------------------------------------------------------
+
+
+async def handle_limit_filled(
+    parsed: dict,
+    raw: RawSignal,
+    session,
+) -> None:
+    """
+    Mark a PENDING limit trade as OPEN when the limit order was triggered.
+
+    Gets the fill price from the current position on Binance.
+    """
+    trade = await find_trade_for_update(parsed, raw, session)
+
+    if not trade:
+        logger.warning("[LIMIT_FILLED] No trade found")
+        return
+
+    if trade.status != TradeStatus.PENDING:
+        logger.warning("[LIMIT_FILLED] Trade #%s is %s — not pending", trade.id, trade.status.value)
+        return
+
+    # Get the actual fill price from the position
+    pos = await exchange.get_position(trade.pair)
+    if pos and float(pos.get("positionAmt", 0)) > 0:
+        entry_price = float(pos.get("entryPrice", trade.planned_entry))
+    else:
+        # Fallback: use planned entry price
+        entry_price = trade.planned_entry
+
+    trade.status = TradeStatus.OPEN
+    trade.entry_price = entry_price
+    trade.entry_time = datetime.datetime.utcnow()
+
+    log_entry = TradeLog(
+        trade_id    = trade.id,
+        action      = "LIMIT_FILLED",
+        detail_json = {
+            "entry_price": entry_price,
+            "message": parsed.get("message", ""),
+        },
+    )
+    session.add(log_entry)
+    await session.commit()
+
+    logger.info("[LIMIT_FILLED] ✅ Trade #%s: %s @ %s", trade.id, trade.pair, entry_price)
 
 
 # ---------------------------------------------------------------------------
@@ -233,50 +435,20 @@ async def handle_update_signal(
     """
     Handle an UPDATE-type signal.
 
-    This message is usually a REPLY to a previous OPEN signal.
-    We look up the original signal → find the linked trade → apply the change.
+    Finds the relevant trade (via reply or pair name) and applies the change.
     """
 
     action = parsed["action"]
 
-
-    # --- Find the original trade -----------------------------------------
-
-    if not raw.tg_reply_to_id:
-        logger.warning("[UPDATE] No reply_to — cannot link to a trade")
-        return
-
-    # Step 1: find the RawSignal that this message replies to
-    result = await session.execute(
-        sa_select(RawSignal).where(
-            RawSignal.tg_message_id == raw.tg_reply_to_id
-        )
-    )
-    original_signal = result.scalar_one_or_none()
-
-    if not original_signal:
-        logger.warning(
-            "[UPDATE] Original signal %s not found in database",
-            raw.tg_reply_to_id,
-        )
-        return
-
-    # Step 2: find the Trade linked to that signal
-    result = await session.execute(
-        sa_select(Trade).where(Trade.signal_id == original_signal.id)
-    )
-    trade = result.scalar_one_or_none()
+    trade = await find_trade_for_update(parsed, raw, session)
 
     if not trade:
-        logger.warning(
-            "[UPDATE] No trade for signal_id=%s", original_signal.id
-        )
+        logger.warning("[UPDATE] No trade found for action=%s", action)
         return
 
     if trade.status == TradeStatus.CLOSED:
         logger.warning("[UPDATE] Trade #%s is already closed", trade.id)
         return
-
 
     logger.info("[UPDATE] Trade #%s (%s): %s", trade.id, trade.pair, action)
 
@@ -323,7 +495,16 @@ async def handle_update_signal(
             trade.exit_reason = "signal_closed"
 
             if order:
-                trade.exit_price = order.get("average") or order.get("price")
+                exit_price = float(order.get("avgPrice") or order.get("price") or 0)
+                trade.exit_price = exit_price
+
+                # Calculate PnL
+                if trade.entry_price and trade.entry_quantity:
+                    entry_value = trade.entry_price * trade.entry_quantity
+                    exit_value  = exit_price * trade.entry_quantity
+                    trade.pnl_amount   = round(exit_value - entry_value, 2)
+                    if entry_value > 0:
+                        trade.pnl_percent = round((exit_value - entry_value) / entry_value * 100, 2)
 
         else:
             logger.info("[UPDATE] Unhandled action: %s", action)
@@ -356,10 +537,11 @@ async def on_message(event: events.NewMessage.Event):
     """
     Called when a new message arrives in the VIP channel.
 
-    1. Parse text with AI → get structured JSON.
+    1. Parse text with regex (instant) → get structured JSON.
     2. Save to database (raw_signals table).
     3. If action is OPEN → execute a trade.
-    4. If action is UPDATE/CLOSE → modify the linked trade.
+    4. If action is CANCEL → cancel limit order.
+    5. If action is UPDATE/CLOSE → modify the linked trade.
     """
 
     msg = event.message
@@ -374,7 +556,7 @@ async def on_message(event: events.NewMessage.Event):
     reply_to = msg.reply_to.reply_to_msg_id if msg.reply_to else None
 
 
-    # --- 1. AI parse -----------------------------------------------------
+    # --- 1. Parse --------------------------------------------------------
 
     parsed, latency = await ai_parser.parse(
         text, is_reply=(reply_to is not None)
@@ -418,6 +600,12 @@ async def on_message(event: events.NewMessage.Event):
             if action == "OPEN":
                 await handle_open_signal(parsed, raw, session)
 
+            elif action == "CANCEL_ORDER":
+                await handle_cancel_order(parsed, raw, session)
+
+            elif action == "LIMIT_FILLED":
+                await handle_limit_filled(parsed, raw, session)
+
             elif action in (
                 "UPDATE_STOP", "UPDATE_TP", "PARTIAL_CLOSE",
                 "MOVE_TO_BE", "CLOSE",
@@ -442,11 +630,10 @@ async def on_message(event: events.NewMessage.Event):
 async def on_edit(event: events.MessageEdited.Event):
     """
     Called when an existing message is edited.
-    We re-parse it and store the new version.
+    Re-parses and applies the new action.
 
-    Note: currently we do NOT modify the linked trade on edit
-    (that would be too risky — an edit could be a typo fix).
-    Future versions might handle this.
+    Important: edits can carry new actions (e.g. "changed stop to X").
+    We process them the same as new messages.
     """
 
     msg = event.message
@@ -459,7 +646,7 @@ async def on_edit(event: events.MessageEdited.Event):
     reply_to = msg.reply_to.reply_to_msg_id if msg.reply_to else None
 
 
-    # --- AI parse --------------------------------------------------------
+    # --- Parse -----------------------------------------------------------
 
     parsed, latency = await ai_parser.parse(
         text, is_reply=(reply_to is not None)
@@ -476,7 +663,7 @@ async def on_edit(event: events.MessageEdited.Event):
     )
 
 
-    # --- Store as new raw_signal row (with is_edit=True) -----------------
+    # --- Store and execute -----------------------------------------------
 
     async with async_session() as session:
 
@@ -493,7 +680,36 @@ async def on_edit(event: events.MessageEdited.Event):
             received_at       = datetime.datetime.utcnow(),
         )
         session.add(raw)
-        await session.commit()
+        await session.flush()
+
+
+        # --- Execute edit as a real action -------------------------------
+
+        try:
+
+            if action == "CANCEL_ORDER":
+                await handle_cancel_order(parsed, raw, session)
+
+            elif action == "LIMIT_FILLED":
+                await handle_limit_filled(parsed, raw, session)
+
+            elif action in (
+                "UPDATE_STOP", "UPDATE_TP", "PARTIAL_CLOSE",
+                "MOVE_TO_BE", "CLOSE",
+            ):
+                await handle_update_signal(parsed, raw, session)
+
+            elif action == "OPEN":
+                # Edits that are new OPEN signals → rare but possible
+                await handle_open_signal(parsed, raw, session)
+
+            # skip UNKNOWN, etc.
+
+        except Exception as exc:
+            logger.error(
+                "[EDIT-ERROR] %s for msg=%s: %s", action, msg.id, exc,
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +763,76 @@ async def main_async():
     client.add_event_handler(
         on_edit, events.MessageEdited(chats=[channel])
     )
+
+
+    # --- Background SL/TP monitor ----------------------------------------
+    # Binance Demo doesn't support STOP_MARKET/TAKE_PROFIT orders.
+    # We poll prices every 2 seconds and close positions ourselves.
+
+    async def monitor_sl_tp():
+        """Background task: check if any open trade hit SL or TP."""
+        while True:
+            try:
+                await asyncio.sleep(2)
+                async with async_session() as session:
+                    from sqlalchemy import select as sa_select
+                    result = await session.execute(
+                        sa_select(Trade).where(
+                            Trade.status == TradeStatus.OPEN,
+                            Trade.current_stop.isnot(None),
+                            Trade.current_tp.isnot(None),
+                        )
+                    )
+                    open_trades = result.scalars().all()
+
+                    for trade in open_trades:
+                        hit = await exchange.check_sl_tp(
+                            trade.pair,
+                            trade.current_stop,
+                            trade.current_tp,
+                        )
+                        if hit:
+                            logger.warning(
+                                "[SL/TP MONITOR] %s hit %s — closing position",
+                                trade.pair, hit,
+                            )
+                            order = await exchange.close_position(trade.pair)
+                            if order:
+                                exit_price = float(
+                                    order.get("avgPrice") or order.get("price") or 0
+                                )
+                                trade.status = TradeStatus.CLOSED
+                                trade.exit_time = datetime.datetime.utcnow()
+                                trade.exit_price = exit_price
+                                trade.exit_reason = hit
+
+                                if trade.entry_price and trade.entry_quantity:
+                                    entry_val = trade.entry_price * trade.entry_quantity
+                                    exit_val = exit_price * trade.entry_quantity
+                                    trade.pnl_amount = round(exit_val - entry_val, 2)
+                                    if entry_val > 0:
+                                        trade.pnl_percent = round(
+                                            (exit_val - entry_val) / entry_val * 100, 2
+                                        )
+
+                                log_entry = TradeLog(
+                                    trade_id=trade.id,
+                                    action="SL_TP_HIT",
+                                    detail_json={
+                                        "reason": hit,
+                                        "exit_price": exit_price,
+                                    },
+                                )
+                                session.add(log_entry)
+                                await session.commit()
+                                logger.info(
+                                    "[SL/TP MONITOR] ✅ Trade #%s closed: %s, pnl=$%.2f",
+                                    trade.id, hit, trade.pnl_amount,
+                                )
+            except Exception as exc:
+                logger.error("[SL/TP MONITOR] error: %s", exc, exc_info=True)
+
+    asyncio.create_task(monitor_sl_tp())
 
 
     # --- Run forever -----------------------------------------------------
