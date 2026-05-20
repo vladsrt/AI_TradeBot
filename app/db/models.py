@@ -51,6 +51,8 @@ class SignalAction(str, enum.Enum):
     PARTIAL_CLOSE = "PARTIAL_CLOSE"  # close part, move SL to BE
     MOVE_TO_BE    = "MOVE_TO_BE"     # move stop-loss to entry price
     CLOSE         = "CLOSE"          # exit the position
+    CANCEL_ORDER  = "CANCEL_ORDER"   # cancel a limit order
+    LIMIT_FILLED  = "LIMIT_FILLED"   # limit order was filled
     UNKNOWN       = "UNKNOWN"        # could not classify
 
 
