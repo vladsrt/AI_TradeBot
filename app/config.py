@@ -76,7 +76,7 @@ class Config:
     # --- Trading defaults ------------------------------------------------
 
     DEFAULT_DEPOSIT: float = float(
-        os.getenv("DEFAULT_DEPOSIT", "1000")
+        os.getenv("DEFAULT_DEPOSIT", "10")
     )
 
     DEFAULT_RISK_PERCENT: float = float(
