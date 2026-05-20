@@ -2,18 +2,23 @@
 Real-time trading statistics dashboard.
 
 FastAPI + static HTML with JS polling for real-time stats.
+Includes both closed trade history AND live open positions with unrealized PnL.
 """
 from __future__ import annotations
 
 import datetime
 from pathlib import Path
+import logging
 
 from fastapi import FastAPI
+
+logger = logging.getLogger("dashboard")
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select as sa_select
 
 from app.db.session import async_session
 from app.db.models import Trade, TradeStatus, RawSignal
+from app.exchange.broker import exchange
 
 
 # ---------------------------------------------------------------------------
@@ -27,12 +32,53 @@ DASHBOARD_HTML = (
 ).read_text()
 
 
+@app.on_event("startup")
+async def startup():
+    """Connect to Binance Demo on dashboard boot."""
+    await exchange.connect()
+
+
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
 
+async def get_open_positions_live() -> list[dict]:
+    """Fetch open positions from Binance Demo (real exchange data)."""
+    try:
+        positions = await exchange.get_all_positions()
+    except Exception as exc:
+        logger.error("Live positions fetch failed: %s", exc)
+        return []
+
+    result = []
+    for pos in positions:
+        symbol = pos.get("symbol", "?")
+        amt = float(pos.get("positionAmt", 0))
+        entry_price = float(pos.get("entryPrice", 0))
+        mark_price = float(pos.get("markPrice", 0))
+        un_pnl = float(pos.get("unRealizedProfit", 0))
+        leverage = float(pos.get("leverage", 20))
+
+        if amt != 0:
+            pnl_pct = 0.0
+            if entry_price > 0 and amt > 0:
+                pnl_pct = round((mark_price - entry_price) / entry_price * 100 * leverage, 2)
+
+            result.append({
+                "pair": symbol,
+                "entry_price": round(entry_price, 6),
+                "mark_price": round(mark_price, 6),
+                "quantity": abs(amt),
+                "leverage": int(leverage),
+                "unrealized_pnl": round(un_pnl, 2),
+                "unrealized_pnl_pct": pnl_pct,
+            })
+
+    return result
+
+
 async def get_stats():
-    """Pull all trade stats from SQLite in one shot."""
+    """Pull all trade stats + live positions in one shot."""
 
     async with async_session() as session:
 
@@ -43,6 +89,10 @@ async def get_stats():
 
         opened_result = await session.scalar(
             sa_select(func.count()).where(Trade.status == TradeStatus.OPEN)
+        )
+
+        pending_result = await session.scalar(
+            sa_select(func.count()).where(Trade.status == TradeStatus.PENDING)
         )
 
         error_result = await session.scalar(
@@ -149,24 +199,29 @@ async def get_stats():
                 "pnl_pct": round(worst.pnl_percent, 2),
             }
 
+        # --- Live open positions from exchange ---
+        open_positions = await get_open_positions_live()
+
         # --- Build final dict ---
         return {
-            "total_trades":   total_result or 0,
-            "open_trades":    opened_result or 0,
-            "closed_trades":  len(closed_trades),
-            "error_trades":   error_result or 0,
-            "wins":           len(wins),
-            "losses":         len(losses),
-            "breakeven":      len(breakeven),
-            "win_rate":       round(win_rate, 1),
-            "total_pnl":      round(total_pnl, 2),
-            "total_pnl_pct":  round(total_pnl_pct, 2),
-            "best_trade":     best_trade,
-            "worst_trade":    worst_trade,
-            "pairs":          pairs_list,
-            "avg_latency_ms": round(avg_latency, 0) if avg_latency else 0,
-            "recent_signals": recent_list,
-            "generated_at":   datetime.datetime.utcnow().strftime(
+            "total_trades":    total_result or 0,
+            "open_trades":     opened_result or 0,
+            "pending_trades":  pending_result or 0,
+            "closed_trades":   len(closed_trades),
+            "error_trades":    error_result or 0,
+            "wins":            len(wins),
+            "losses":          len(losses),
+            "breakeven":       len(breakeven),
+            "win_rate":        round(win_rate, 1),
+            "total_pnl":       round(total_pnl, 2),
+            "total_pnl_pct":   round(total_pnl_pct, 2),
+            "best_trade":      best_trade,
+            "worst_trade":     worst_trade,
+            "pairs":           pairs_list,
+            "open_positions":  open_positions,
+            "avg_latency_ms":  round(avg_latency, 0) if avg_latency else 0,
+            "recent_signals":  recent_list,
+            "generated_at":    datetime.datetime.utcnow().strftime(
                 "%Y-%m-%d %H:%M:%S UTC"
             ),
         }

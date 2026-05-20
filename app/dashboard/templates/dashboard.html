@@ -15,6 +15,7 @@
             --red: #f85149;
             --yellow: #d2991d;
             --blue: #58a6ff;
+            --purple: #bc8cff;
             --radius: 8px;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -44,10 +45,7 @@
             margin-right: 8px;
             animation: pulse 2s infinite;
         }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
         .generated { font-size: 13px; color: var(--dim); }
         .grid {
             display: grid;
@@ -74,11 +72,26 @@
         .red { color: var(--red); }
         .yellow { color: var(--yellow); }
         .blue { color: var(--blue); }
+        .purple { color: var(--purple); }
         .section-title {
             font-size: 16px;
             font-weight: 600;
             margin-bottom: 12px;
+            margin-top: 8px;
         }
+        .position-row {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }
+        .position-row:last-child { border-bottom: none; }
+        .position-row .pos-pair { font-weight: 700; min-width: 110px; }
+        .position-row .pos-metric { text-align: center; }
+        .position-row .pos-metric .val { font-size: 16px; font-weight: 600; }
+        .position-row .pos-metric .sub { font-size: 11px; color: var(--dim); }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -109,6 +122,7 @@
         .pill-open { background: rgba(88,166,255,0.15); color: var(--blue); }
         .pill-close { background: rgba(139,148,158,0.15); color: var(--dim); }
         .pill-update { background: rgba(210,153,29,0.15); color: var(--yellow); }
+        .pill-cancel { background: rgba(248,81,73,0.15); color: var(--red); }
         .pill-unknown { background: rgba(139,148,158,0.1); color: var(--dim); }
         .pair-row {
             display: flex;
@@ -142,6 +156,16 @@
             text-align: center;
             font-size: 16px;
         }
+        .live-badge {
+            display: inline-block;
+            font-size: 10px;
+            background: rgba(63,185,80,0.15);
+            color: var(--green);
+            padding: 2px 8px;
+            border-radius: 10px;
+            margin-left: 8px;
+            animation: pulse 2s infinite;
+        }
     </style>
 </head>
 <body>
@@ -153,9 +177,15 @@
 
     <div class="grid" id="metrics"></div>
 
-    <h2 class="section-title">Per Pair</h2>
+    <!-- OPEN POSITIONS — real exchange data -->
+    <h2 class="section-title">Open Positions <span class="live-badge">LIVE</span></h2>
+    <div class="card" id="positions" style="margin-bottom: 24px;">
+        <div class="empty-state">No open positions on Binance Demo...</div>
+    </div>
+
+    <h2 class="section-title">Closed Trades — Per Pair</h2>
     <div class="card" id="pairs" style="margin-bottom: 24px;">
-        <div class="empty-state">No trades yet...</div>
+        <div class="empty-state">No closed trades yet...</div>
     </div>
 
     <h2 class="section-title">Recent Signals</h2>
@@ -170,7 +200,7 @@
             if (val === 0) return '<span>$' + val + '</span>';
             const sign = val > 0 ? '+' : '';
             const cls  = val > 0 ? 'green' : 'red';
-            return '<span class="' + cls + '">' + sign + '$' + val + '</span>';
+            return '<span class="' + cls + '">' + sign + '$' + val.toFixed(2) + '</span>';
         }
 
         function fmtPct(val) {
@@ -183,7 +213,8 @@
         function pillClass(action) {
             if (action === 'OPEN') return 'pill-open';
             if (action === 'CLOSE') return 'pill-close';
-            if (['UPDATE_STOP','UPDATE_TP','MOVE_TO_BE','PARTIAL_CLOSE'].includes(action)) return 'pill-update';
+            if (action === 'CANCEL_ORDER') return 'pill-cancel';
+            if (['UPDATE_STOP','UPDATE_TP','MOVE_TO_BE','PARTIAL_CLOSE','LIMIT_FILLED'].includes(action)) return 'pill-update';
             return 'pill-unknown';
         }
 
@@ -197,13 +228,13 @@
                 // Metrics cards
                 let html = '';
 
-                html += '<div class="card"><div class="label">Total PnL</div><div class="value">' + fmtPnl(d.total_pnl) + '</div><div class="sub">' + fmtPct(d.total_pnl_pct) + '</div></div>';
+                html += '<div class="card"><div class="label">Total Closed PnL</div><div class="value">' + fmtPnl(d.total_pnl) + '</div><div class="sub">' + fmtPct(d.total_pnl_pct) + ' · ' + d.closed_trades + ' trades</div></div>';
 
                 html += '<div class="card"><div class="label">Win Rate</div><div class="value ' + (d.win_rate >= 50 ? 'green' : d.win_rate >= 30 ? 'yellow' : 'red') + '">' + d.win_rate + '%</div><div class="sub">' + d.wins + 'W / ' + d.losses + 'L / ' + d.breakeven + 'B</div></div>';
 
-                html += '<div class="card"><div class="label">Trades</div><div class="value">' + d.total_trades + '</div><div class="sub">' + d.open_trades + ' open · ' + d.closed_trades + ' closed</div></div>';
+                html += '<div class="card"><div class="label">Total Trades</div><div class="value">' + d.total_trades + '</div><div class="sub">' + d.open_trades + ' open · ' + d.pending_trades + ' pending · ' + d.closed_trades + ' closed</div></div>';
 
-                html += '<div class="card"><div class="label">Avg Parse Latency</div><div class="value blue">' + Math.round(d.avg_latency_ms) + 'ms</div><div class="sub">LLM response time</div></div>';
+                html += '<div class="card"><div class="label">Avg Parse Latency</div><div class="value blue">' + Math.round(d.avg_latency_ms) + 'ms</div><div class="sub">Regex parser (no LLM)</div></div>';
 
                 if (d.best_trade) {
                     html += '<div class="card"><div class="label">Best Trade</div><div class="value green">$' + d.best_trade.pnl + '</div><div class="sub">' + d.best_trade.pair + ' — ' + d.best_trade.pnl_pct + '%</div></div>';
@@ -215,12 +246,33 @@
 
                 $('metrics').innerHTML = html;
 
-                // Pairs
+                // LIVE OPEN POSITIONS
+                if (d.open_positions && d.open_positions.length > 0) {
+                    let posHtml = '';
+                    d.open_positions.forEach(p => {
+                        const pnlCls = p.unrealized_pnl >= 0 ? 'green' : 'red';
+                        const pctCls = p.unrealized_pnl_pct >= 0 ? 'green' : 'red';
+
+                        posHtml += '<div class="position-row">';
+                        posHtml += '<span class="pos-pair">' + p.pair + '</span>';
+                        posHtml += '<span class="pos-metric"><div class="sub">Entry</div><div class="val">$' + p.entry_price + '</div></span>';
+                        posHtml += '<span class="pos-metric"><div class="sub">Mark</div><div class="val">$' + p.mark_price + '</div></span>';
+                        posHtml += '<span class="pos-metric"><div class="sub">Size</div><div class="val">' + p.quantity.toFixed(0) + '</div></span>';
+                        posHtml += '<span class="pos-metric"><div class="sub">Lev</div><div class="val">' + p.leverage + 'x</div></span>';
+                        posHtml += '<span class="pos-metric"><div class="sub">Unreal. PnL</div><div class="val ' + pnlCls + '">$' + p.unrealized_pnl.toFixed(2) + '</div><div class="sub ' + pctCls + '">' + p.unrealized_pnl_pct + '%</div></span>';
+                        posHtml += '</div>';
+                    });
+                    $('positions').innerHTML = posHtml;
+                } else {
+                    $('positions').innerHTML = '<div class="empty-state">No open positions on Binance Demo</div>';
+                }
+
+                // PAIRS
                 if (d.pairs && d.pairs.length > 0) {
                     let pairHtml = '';
                     d.pairs.forEach(p => {
                         const width = Math.min(p.win_rate, 100);
-                        const color = p.pnl > 0 ? 'var(--green)' : 'var(--red)';
+                        const color = p.pnl >= 0 ? 'var(--green)' : 'var(--red)';
                         pairHtml += '<div class="pair-row">';
                         pairHtml += '<span class="name">' + p.pair + '</span>';
                         pairHtml += '<div class="track"><div class="fill" style="width:' + width + '%;background:' + color + ';"></div></div>';
@@ -232,7 +284,7 @@
                     $('pairs').innerHTML = '<div class="empty-state">No closed trades yet...</div>';
                 }
 
-                // Recent signals
+                // RECENT SIGNALS
                 if (d.recent_signals && d.recent_signals.length > 0) {
                     let sigHtml = '';
                     d.recent_signals.forEach(s => {
@@ -252,7 +304,7 @@
         }
 
         refresh();
-        setInterval(refresh, 10000); // refresh every 10 seconds
+        setInterval(refresh, 5000); // refresh every 5 seconds (was 10)
     </script>
 </body>
 </html>
